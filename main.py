@@ -108,6 +108,7 @@ class MidiHandler:
         self.input_port  = None
         self.output_port = None
         self._lock       = threading.Lock()
+        self._dead_ports = []   # see retire_dead_input()
 
     def get_input_names(self):
         """All input ports except our own loopMIDI output.
@@ -169,8 +170,23 @@ class MidiHandler:
             except Exception as e:
                 # Port died — clear it and signal disconnection to caller
                 with self._lock:
-                    self.input_port = None
+                    if self.input_port is port:
+                        self.retire_dead_input()
                 raise ConnectionError(f"Input port disconnected: {e}")
+
+    def retire_dead_input(self):
+        """Drop an input whose device was unplugged WITHOUT closing it.
+        Closing a WinMM input after its device vanished fails partway in
+        rtmidi, and any later close (including mido's __del__ on garbage
+        collection, or rtmidi's C++ destructor) then corrupts the heap and
+        hard-crashes the process. So: mark it closed so mido never touches
+        it again, and keep a reference so the native object is never freed.
+        Leaks one dead handle per unplug — harmless. Call with _lock held."""
+        port = self.input_port
+        self.input_port = None
+        if port:
+            port.closed = True
+            self._dead_ports.append(port)
 
     def close(self):
         with self._lock:
@@ -490,7 +506,10 @@ class API:
         return self.midi.get_input_names()
 
     def set_input(self, full_name):
-        return self.midi.set_input(full_name)
+        ok = self.midi.set_input(full_name)
+        if ok:
+            remember_last_input(full_name)
+        return ok
 
     def get_output_port_name(self):
         return OUTPUT_PORT_NAME
@@ -715,31 +734,65 @@ def monitor_loop(midi: MidiHandler, engine: ScriptEngine, api: API):
         time.sleep(0.001)
 
 
+def remember_last_input(full_name):
+    """Persist the device name (without the OS port index, which can change
+    when the device is replugged) so we can auto-reconnect to it later."""
+    cfg = load_config()
+    cfg["last_input"] = strip_port_number(full_name)
+    save_config(cfg)
+
+
+def try_reconnect_last_input(midi: MidiHandler, api: API, available):
+    """If nothing is connected and the last-used device is present, reconnect.
+    Also handles connecting to it on launch."""
+    last = load_config().get("last_input")
+    if not last:
+        return
+    match = next(
+        (n for n in available
+         if OUTPUT_PORT_NAME not in n and strip_port_number(n) == last),
+        None,
+    )
+    if not match or not midi.set_input(match):
+        return
+    print(f"[MIDI] Auto-reconnected: {match}")
+    if api._window:
+        payload = json.dumps({"full": match, "display": strip_port_number(match)})
+        try:
+            api._window.evaluate_js(f"window.onMidiReconnected({payload})")
+        except Exception:
+            pass
+
+
 def port_watchdog(midi: MidiHandler, api: API):
-    """Poll the OS port list every second. If the connected port vanishes, signal JS."""
+    """Poll the OS port list every second. If the connected port vanishes, signal JS.
+    While disconnected, reconnect to the last-used device as soon as it reappears."""
     while True:
         time.sleep(1)
         with midi._lock:
             port = midi.input_port
             connected_name = getattr(port, 'name', None) if port else None
-        if connected_name:
-            try:
-                available = mido.get_input_names()
-            except Exception:
-                continue
-            still_there = any(
-                connected_name in n or n in connected_name
-                for n in available
-            )
-            if not still_there:
-                with midi._lock:
-                    midi.input_port = None
-                print(f"[MIDI] Port vanished: {connected_name}")
-                if api._window:
-                    try:
-                        api._window.evaluate_js("window.onMidiDisconnected()")
-                    except Exception:
-                        pass
+        try:
+            available = mido.get_input_names()
+        except Exception:
+            continue
+        if not connected_name:
+            try_reconnect_last_input(midi, api, available)
+            continue
+        still_there = any(
+            connected_name in n or n in connected_name
+            for n in available
+        )
+        if not still_there:
+            with midi._lock:
+                if midi.input_port is port:
+                    midi.retire_dead_input()
+            print(f"[MIDI] Port vanished: {connected_name}")
+            if api._window:
+                try:
+                    api._window.evaluate_js("window.onMidiDisconnected()")
+                except Exception:
+                    pass
 
 
 
@@ -1059,6 +1112,13 @@ def main():
     window.events.loaded += on_loaded
 
     webview.start(debug=False)
+
+    # If a device was unplugged this session, its dead port is still parked in
+    # midi._dead_ports. Normal interpreter shutdown would free it and trigger
+    # the same native crash on exit, so skip teardown — everything's saved.
+    if midi._dead_ports:
+        sys.stdout.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":

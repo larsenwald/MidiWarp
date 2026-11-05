@@ -241,6 +241,8 @@ nav {
 .dd-row:hover .dd-name { color: var(--gold); }
 .dd-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: var(--sage); box-shadow: 0 0 6px rgba(122,158,138,0.6); }
 .dd-name { font-size: 13px; font-weight: 300; flex: 1; color: var(--text); transition: color 0.15s; }
+.dd-row.selected .dd-name { color: var(--sage); }
+.dd-check { font-size: 12px; color: var(--sage); flex-shrink: 0; }
 
 /* Info chips */
 .info-chips { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
@@ -1009,8 +1011,6 @@ nav {
   <div class="sb-item gold"><div class="sb-dot"></div><span id="sbOutTxt">Out: MidiWarp_OUT</span></div>
   <div class="sb-sep">·</div>
   <div class="sb-item" id="sbSc"><div class="sb-dot"></div><span id="sbScTxt">0 scripts active</span></div>
-  <div class="sb-sep">·</div>
-  <div class="sb-item"><div class="sb-dot"></div><span id="sbEvTxt">0 events</span></div>
 </div>
 
 <script>
@@ -1107,7 +1107,6 @@ window.onMidiEvent = function(payload) {
   if (paused) return;
   const { raw, tx, script_errors } = payload;
   eventCount++;
-  document.getElementById('sbEvTxt').textContent = eventCount + ' events';
 
   // Update stored errors and reflect in UI
   if (script_errors) {
@@ -1265,6 +1264,7 @@ function addLogRow(raw, tx) {
 
 // Called by Python when the input port dies
 window.onMidiDisconnected = function() {
+  currentInput = null;
   const orb        = document.getElementById('orb');
   const deviceName = document.getElementById('orbLabel').textContent;
   orb.classList.remove('connected');
@@ -1303,6 +1303,7 @@ function toggleDD() {
 }
 
 let availablePorts = []; // [{ full, display }, ...]
+let currentInput   = null; // full name of the connected port, for the ✓ in the picker
 
 async function openDD() {
   const dd   = document.getElementById('orbDD');
@@ -1318,12 +1319,16 @@ async function openDD() {
   }
 
   // Use index into availablePorts — avoids any string-escaping issues in onclick
-  rows.innerHTML = availablePorts.map((p, i) => `
-    <div class="dd-row" data-port-index="${i}">
+  rows.innerHTML = availablePorts.map((p, i) => {
+    const sel = p.full === currentInput;
+    return `
+    <div class="dd-row${sel ? ' selected' : ''}" data-port-index="${i}">
       <div class="dd-dot"></div>
       <div class="dd-name">${esc(p.display)}</div>
+      ${sel ? '<div class="dd-check">✓</div>' : ''}
     </div>
-  `).join('');
+  `;
+  }).join('');
 
   // Attach listeners properly — no inline string args
   rows.querySelectorAll('.dd-row').forEach(row => {
@@ -1344,29 +1349,24 @@ document.addEventListener('click', e => {
   }
 });
 
+// Called by Python when the last-used device reappears and was auto-reconnected
+window.onMidiReconnected = function(port) {
+  showConnected(port);
+  startWave();
+};
+
 async function pickPort(port) {
   document.getElementById('orbDD').style.display = 'none';
   ddOpen = false;
 
   // Update UI immediately
-  const orb = document.getElementById('orb');
-  orb.classList.remove('disconnected');
-  orb.classList.add('connected');
-  document.getElementById('orbLabel').textContent = port.display;
-  document.getElementById('orbSub').textContent = 'connected';
-  document.getElementById('navLed').classList.add('on');
-  document.getElementById('navTxt').textContent = port.display;
-
+  showConnected(port);
+  const orb  = document.getElementById('orb');
   const chip = document.getElementById('inputChip');
-  chip.classList.add('active-chip');
-  chip.style.borderColor = '';
-  chip.style.color = '';
-  document.getElementById('inputChipTxt').textContent = port.display;
-  document.getElementById('sbIn').classList.add('green');
-  document.getElementById('sbInTxt').textContent = 'In: ' + port.display;
 
   const ok = await call('set_input', port.full);
   if (!ok) {
+    currentInput = null;
     orb.classList.remove('connected');
     orb.classList.add('disconnected');
     document.getElementById('orbLabel').textContent = port.display;
@@ -1385,6 +1385,25 @@ async function pickPort(port) {
   }
 }
 
+function showConnected(port) {
+  currentInput = port.full;
+  const orb = document.getElementById('orb');
+  orb.classList.remove('disconnected');
+  orb.classList.add('connected');
+  document.getElementById('orbLabel').textContent = port.display;
+  document.getElementById('orbSub').textContent = 'connected';
+  document.getElementById('navLed').classList.add('on');
+  document.getElementById('navTxt').textContent = port.display;
+
+  const chip = document.getElementById('inputChip');
+  chip.classList.add('active-chip');
+  chip.style.borderColor = '';
+  chip.style.color = '';
+  document.getElementById('inputChipTxt').textContent = port.display;
+  document.getElementById('sbIn').classList.add('green');
+  document.getElementById('sbInTxt').textContent = 'In: ' + port.display;
+}
+
 // ─── FEED CONTROLS ───────────────────────────────────────────────────────────
 function togglePause() {
   paused = !paused;
@@ -1395,7 +1414,6 @@ function togglePause() {
 
 function clearLog() {
   eventCount = 0;
-  document.getElementById('sbEvTxt').textContent = '0 events';
   document.getElementById('eventLog').innerHTML =
     '<div class="log-empty" id="logEmpty"><div class="log-empty-glyph">∅</div><span>No events — connect a MIDI input to begin</span></div>';
   waveAmps       = Array(WAVE_POINTS).fill(17);
