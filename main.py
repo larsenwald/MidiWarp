@@ -498,6 +498,7 @@ class API:
         self.midi    = midi
         self.engine  = engine
         self._window = None
+        self._tray   = None
 
     def set_window(self, window):
         self._window = window
@@ -510,6 +511,22 @@ class API:
         if ok:
             remember_last_input(full_name)
         return ok
+
+    def get_startup_enabled(self):
+        return startup_task_exists()
+
+    def set_startup_enabled(self, enabled):
+        """Returns the actual state afterwards, so the UI can't drift from reality."""
+        if enabled:
+            enable_startup_task()
+        else:
+            disable_startup_task()
+        if self._tray:
+            try:
+                self._tray.update_menu()
+            except Exception:
+                pass
+        return startup_task_exists()
 
     def get_output_port_name(self):
         return OUTPUT_PORT_NAME
@@ -744,7 +761,7 @@ def remember_last_input(full_name):
 
 def try_reconnect_last_input(midi: MidiHandler, api: API, available):
     """If nothing is connected and the last-used device is present, reconnect.
-    Also handles connecting to it on launch."""
+    Also handles connecting on launch (e.g. after a Windows-startup boot)."""
     last = load_config().get("last_input")
     if not last:
         return
@@ -816,8 +833,26 @@ def setup_tray(window, midi, base_dir):
     """Create and run the system tray icon in a background thread."""
 
     def show(icon, item):
+        # window.show() first: if we launched hidden (--startup), the WinForms
+        # form still thinks it's invisible until told otherwise.
+        try:
+            window.show()
+        except Exception:
+            pass
         hwnd = get_hwnd(window)
         show_from_tray(hwnd)
+
+    def toggle_startup(icon, item):
+        if startup_task_exists():
+            disable_startup_task()
+        else:
+            enable_startup_task()
+        icon.update_menu()
+        # Keep the in-app toggle in sync
+        try:
+            window.evaluate_js(f"window.onStartupSetting({json.dumps(startup_task_exists())})")
+        except Exception:
+            pass
 
     def quit_app(icon, item):
         icon.stop()
@@ -830,6 +865,8 @@ def setup_tray(window, midi, base_dir):
         "MidiWarp",
         menu=pystray.Menu(
             pystray.MenuItem("Show", show, default=True),
+            pystray.MenuItem("Start with Windows", toggle_startup,
+                             checked=lambda item: startup_task_exists()),
             pystray.MenuItem("Quit", quit_app),
         )
     )
@@ -849,6 +886,104 @@ LOOPMIDI_PATHS = [
     r"C:\Program Files (x86)\Tobias Erichsen\loopMIDI\loopMIDI.exe",
     r"C:\Program Files\Tobias Erichsen\loopMIDI\loopMIDI.exe",
 ]
+
+# ─── START WITH WINDOWS ───────────────────────────────────────────────────────
+# MidiWarp runs elevated (uac_admin), and Windows silently refuses to launch
+# elevated apps from the Run key / Startup folder. A Task Scheduler logon task
+# with "highest privileges" is the supported way to autostart without a UAC
+# prompt. Creating it needs admin, which we already have.
+
+STARTUP_TASK_NAME = "MidiWarp"
+STARTUP_FLAG      = "--startup"
+
+def _startup_command():
+    """(exe, arguments) that relaunch this app in quiet startup mode."""
+    if getattr(sys, "frozen", False):
+        return sys.executable, STARTUP_FLAG
+    # Running from source: use pythonw so no console window appears
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if not os.path.exists(pyw):
+        pyw = sys.executable
+    script = os.path.abspath(__file__)
+    return pyw, f'"{script}" {STARTUP_FLAG}'
+
+def startup_task_exists():
+    try:
+        return subprocess.call(
+            ["schtasks", "/Query", "/TN", STARTUP_TASK_NAME],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ) == 0
+    except Exception:
+        return False
+
+def enable_startup_task():
+    from xml.sax.saxutils import escape
+    exe, args = _startup_command()
+    user = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}"
+    # XML instead of plain schtasks flags so we can turn off the default
+    # 72-hour execution limit (which would kill MidiWarp after 3 days) and the
+    # "don't start / stop on battery" defaults (laptops).
+    xml = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Start MidiWarp quietly in the tray at logon.</Description></RegistrationInfo>
+  <Triggers>
+    <LogonTrigger><Enabled>true</Enabled><UserId>{escape(user)}</UserId></LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{escape(user)}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{escape(exe)}</Command>
+      <Arguments>{escape(args)}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"""
+    xml_path = os.path.join(DATA_DIR, "startup_task.xml")
+    try:
+        with open(xml_path, "w", encoding="utf-16") as f:
+            f.write(xml)
+        rc = subprocess.call(
+            ["schtasks", "/Create", "/TN", STARTUP_TASK_NAME, "/XML", xml_path, "/F"],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if rc != 0:
+            print(f"[Startup] schtasks /Create failed (exit {rc})")
+        return rc == 0
+    except Exception as e:
+        print(f"[Startup] Could not create startup task: {e}")
+        return False
+    finally:
+        try:
+            os.remove(xml_path)
+        except Exception:
+            pass
+
+def disable_startup_task():
+    try:
+        return subprocess.call(
+            ["schtasks", "/Delete", "/TN", STARTUP_TASK_NAME, "/F"],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ) == 0
+    except Exception as e:
+        print(f"[Startup] Could not delete startup task: {e}")
+        return False
+
 
 def _push(window, key, label, status, message=None):
     if not window:
@@ -1058,6 +1193,9 @@ def main():
         base = os.path.dirname(os.path.abspath(__file__))
     html_path = os.path.join(base, "index.html")
 
+    # Launched by the Windows-startup task: start quietly in the tray
+    quiet_start = STARTUP_FLAG in sys.argv[1:]
+
     cfg    = load_config()
     bounds = cfg.get("window_bounds", {})
     window = webview.create_window(
@@ -1072,11 +1210,13 @@ def main():
         resizable=True,
         frameless=True,
         easy_drag=False,
+        hidden=quiet_start,
     )
 
     api.set_window(window)
 
     tray = setup_tray(window, midi, base)
+    api._tray = tray
 
     def on_closed():
         try:
@@ -1107,6 +1247,13 @@ def main():
                 t.start()
                 w = threading.Thread(target=port_watchdog, args=(midi, api), daemon=True)
                 w.start()
+            elif quiet_start:
+                # Startup checks failed while hidden: surface the splash
+                # error instead of failing invisibly in the tray.
+                try:
+                    window.show()
+                except Exception:
+                    pass
         threading.Thread(target=_run, daemon=True).start()
 
     window.events.loaded += on_loaded

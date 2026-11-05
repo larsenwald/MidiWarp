@@ -134,6 +134,17 @@ nav {
 .page { display: none; height: 100%; }
 .page.active { display: flex; }
 
+/* Settings */
+.settings-page { justify-content: center; overflow-y: auto; }
+.settings-col { width: 100%; max-width: 560px; padding: 40px 24px; }
+.settings-group-label { font-family: var(--mono); font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--text-dim); margin: 0 0 10px 2px; }
+.settings-card { border: 1px solid var(--border); border-radius: var(--radius); background: var(--card); }
+.settings-row { display: flex; align-items: center; gap: 20px; padding: 16px 18px; cursor: pointer; transition: background 0.15s; border-radius: var(--radius); }
+.settings-row:hover { background: rgba(255,255,255,0.02); }
+.settings-text { flex: 1; }
+.settings-title { font-size: 16px; color: var(--text); }
+.settings-desc { font-family: var(--mono); font-size: 10px; line-height: 1.6; color: var(--text-dim); margin-top: 4px; }
+
 /* ═══════════ HOME ═══════════ */
 .home { flex-direction: row; overflow: hidden; }
 
@@ -657,6 +668,7 @@ nav {
   <div class="nav-tabs">
     <div class="nav-tab active" onclick="goPage('home',this)">Home</div>
     <div class="nav-tab" onclick="goPage('scripts',this)">Scripts</div>
+    <div class="nav-tab" onclick="goPage('settings',this)">Settings</div>
   </div>
   <div class="nav-right">
     <div class="nav-scripts-badge" id="navBadge">0 scripts active</div>
@@ -949,6 +961,22 @@ nav {
     </div>
   </div>
 
+  <!-- ═══ SETTINGS ═══ -->
+  <div class="page settings-page" id="page-settings">
+    <div class="settings-col">
+      <div class="settings-group-label">General</div>
+      <div class="settings-card">
+        <div class="settings-row" onclick="toggleStartup()">
+          <div class="settings-text">
+            <div class="settings-title">Start with Windows</div>
+            <div class="settings-desc">Launch MidiWarp quietly in the tray when you sign in, and reconnect to your last MIDI device.</div>
+          </div>
+          <div class="ptog" id="startupTog"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <!-- ═══ AI GENERATE MODAL ═══ -->
@@ -1078,6 +1106,8 @@ window.addEventListener('pywebviewready', async () => {
   const outName = await api.get_output_port_name();
   document.getElementById('outputChipTxt').textContent = outName;
   document.getElementById('sbOutTxt').textContent = 'Out: ' + outName;
+
+  setStartupToggle(await api.get_startup_enabled());
 });
 
 async function call(method, ...args) {
@@ -1404,6 +1434,22 @@ function showConnected(port) {
   document.getElementById('sbInTxt').textContent = 'In: ' + port.display;
 }
 
+// ─── START WITH WINDOWS ──────────────────────────────────────────────────────
+function setStartupToggle(on) {
+  document.getElementById('startupTog').classList.toggle('on', !!on);
+}
+
+// Called by Python when the tray menu's checkbox changes it
+window.onStartupSetting = setStartupToggle;
+
+async function toggleStartup() {
+  const tog = document.getElementById('startupTog');
+  const want = !tog.classList.contains('on');
+  setStartupToggle(want);                       // optimistic
+  const actual = await call('set_startup_enabled', want);
+  setStartupToggle(actual);                     // reflect what really happened
+}
+
 // ─── FEED CONTROLS ───────────────────────────────────────────────────────────
 function togglePause() {
   paused = !paused;
@@ -1473,7 +1519,7 @@ function renderScriptList() {
   });
 
   // Toggle listeners
-  document.querySelectorAll('.ptog').forEach(tog => {
+  document.querySelectorAll('.ptog[data-tog]').forEach(tog => {
     const i = parseInt(tog.dataset.tog, 10);
     tog.addEventListener('click', e => { e.stopPropagation(); togScript(i, e); });
   });

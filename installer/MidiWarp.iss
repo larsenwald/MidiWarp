@@ -47,5 +47,9 @@ Name: "{userappdata}\{#MyAppName}\scripts"
 Name: "{group}\{#MyAppName}";         Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\MidiWarp.ico"; Tasks: startmenu
 Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\MidiWarp.ico"; Tasks: desktopicon
 
+[UninstallRun]
+; Remove the "Start with Windows" logon task if the user enabled it
+Filename: "schtasks.exe"; Parameters: "/Delete /TN ""MidiWarp"" /F"; Flags: runhidden; RunOnceId: "RemoveStartupTask"
+
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
